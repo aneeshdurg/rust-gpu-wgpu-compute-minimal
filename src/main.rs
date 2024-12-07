@@ -1,13 +1,14 @@
 use wgpu::util::DeviceExt;
 
+use futures::channel::oneshot;
 use std::{convert::TryInto, num::NonZeroU64};
 use wgpu::{BufferAsyncError, Device, Queue, RequestDeviceError, ShaderModule};
 
 async fn init_device() -> Result<(Device, Queue), RequestDeviceError> {
-    let instance = wgpu::Instance::new(wgpu::Backends::PRIMARY);
+    let instance = wgpu::Instance::new(Default::default());
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
+            power_preference: Default::default(),
             force_fallback_adapter: false,
             compatible_surface: None,
         })
@@ -18,12 +19,14 @@ async fn init_device() -> Result<(Device, Queue), RequestDeviceError> {
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
-                features: wgpu::Features::TIMESTAMP_QUERY
+                required_features: wgpu::Features::TIMESTAMP_QUERY
                     | wgpu::Features::SPIRV_SHADER_PASSTHROUGH,
-                limits: wgpu::Limits::default(),
+                required_limits: Default::default(),
+                memory_hints: Default::default(),
             },
             None,
-        ).await
+        )
+        .await
 }
 
 fn load_collatz_shader_module(device: &Device) -> ShaderModule {
@@ -70,7 +73,9 @@ async fn run_collatz_shader(input: &[u8]) -> Result<Vec<u32>, BufferAsyncError> 
         label: None,
         layout: Some(&pipeline_layout),
         module: &module,
-        entry_point: "main_cs",
+        entry_point: Some("main_cs"),
+        compilation_options: Default::default(),
+        cache: None,
     });
 
     let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -102,10 +107,13 @@ async fn run_collatz_shader(input: &[u8]) -> Result<Vec<u32>, BufferAsyncError> 
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
     {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
         cpass.set_bind_group(0, &bind_group, &[]);
         cpass.set_pipeline(&compute_pipeline);
-        cpass.dispatch(input.len() as u32 / 64, 1, 1);
+        cpass.dispatch_workgroups(input.len() as u32 / 64, 1, 1);
     }
 
     encoder.copy_buffer_to_buffer(
@@ -118,16 +126,19 @@ async fn run_collatz_shader(input: &[u8]) -> Result<Vec<u32>, BufferAsyncError> 
 
     queue.submit(Some(encoder.finish()));
     let buffer_slice = readback_buffer.slice(..);
-    let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
+    let (resolver, waiter) = oneshot::channel();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |res| {
+        resolver.send(res).unwrap();
+    });
     device.poll(wgpu::Maintain::Wait);
+    waiter.await.unwrap()?;
 
-    buffer_future.await.map(|_| {
-        buffer_slice
-            .get_mapped_range()
-            .chunks_exact(4)
-            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
-            .collect::<Vec<_>>()
-    })
+    let res = buffer_slice
+        .get_mapped_range()
+        .chunks_exact(4)
+        .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    Ok(res)
 }
 
 async fn collatz() {
